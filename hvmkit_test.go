@@ -160,12 +160,14 @@ func TestBeforeApply(t *testing.T) {
 				meta := vmmSchema.Meta{Action: action, Data: "input"}
 				want := vmmSchema.Result{Output: "stopped", Error: wantErr, Messages: []*vmmSchema.ResMessage{{Target: "refund"}}}
 				before := func(n int) hvmkit.BeforeApplyHandler {
-					return func(from string, got vmmSchema.Meta) (vmmSchema.Result, bool) {
-						if from != "sender" || !reflect.DeepEqual(got, meta) {
-							t.Fatalf("changed input: %q %+v", from, got)
+					return func(c *hvmkit.Context) {
+						if c.From != "sender" || !reflect.DeepEqual(c.Meta, meta) {
+							t.Fatalf("changed input: %q %+v", c.From, c.Meta)
 						}
 						calls = append(calls, n)
-						return want, n == stop
+						if n == stop {
+							c.Stop(want)
+						}
 					}
 				}
 				app.BeforeApply(before(1), before(2))
@@ -205,15 +207,16 @@ func TestBeforeApplyRepeatedAndEmptySuccess(t *testing.T) {
 	app := hvmkit.New()
 	app.Stateless()
 	calls := 0
-	before := func(string, vmmSchema.Meta) (vmmSchema.Result, bool) {
+	before := func(c *hvmkit.Context) {
 		calls++
-		return vmmSchema.Result{}, calls == 2
+		if calls == 2 {
+			c.Stop(vmmSchema.Result{})
+		}
 	}
 	app.BeforeApply()
 	app.BeforeApply(before, before)
-	app.BeforeApply(func(string, vmmSchema.Meta) (vmmSchema.Result, bool) {
-		t.Fatal("called after handled=true")
-		return vmmSchema.Result{}, false
+	app.BeforeApply(func(*hvmkit.Context) {
+		t.Fatal("called after Stop")
 	})
 	vm, err := app.Build()
 	if err != nil {
@@ -250,5 +253,67 @@ func TestBuildFailureCleanup(t *testing.T) {
 			}()
 			app.BeforeApply(nil)
 		}()
+	}
+}
+
+func TestStopAndRequestIsolation(t *testing.T) {
+	app := hvmkit.New()
+	app.Stateless()
+	afterStop, actions := 0, 0
+	app.BeforeApply(func(c *hvmkit.Context) {
+		if c.From == "blocked" {
+			c.Stop(vmmSchema.Result{Output: "first"})
+			afterStop++ // Stop must not exit this callback.
+			c.Stop(vmmSchema.Result{Output: "last"})
+			return
+		}
+		return // A plain return must allow the Action.
+	})
+	app.Action("A", func(string, vmmSchema.Meta) vmmSchema.Result {
+		actions++
+		return vmmSchema.Result{Output: "action"}
+	})
+	vm, err := app.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []vmmSchema.ExecMode{vmmSchema.ExecModeApply, vmmSchema.ExecModeReplay, vmmSchema.ExecModeDryRun} {
+		meta := vmmSchema.Meta{Action: "A", Mode: mode}
+		if got := vm.Apply("blocked", meta); got.Output != "last" {
+			t.Fatalf("stopped: %+v", got)
+		}
+		if got := vm.Apply("allowed", meta); got.Output != "action" {
+			t.Fatalf("allowed: %+v", got)
+		}
+	}
+	if afterStop != 3 || actions != 3 {
+		t.Fatalf("afterStop=%d actions=%d", afterStop, actions)
+	}
+}
+
+func TestContextChangesReachAction(t *testing.T) {
+	app := hvmkit.New()
+	app.Stateless()
+	app.BeforeApply(func(c *hvmkit.Context) {
+		c.From = "updated"
+		c.Meta.Action = "A"
+		c.Meta.Data = "updated data"
+	}, func(c *hvmkit.Context) {
+		if c.From != "updated" || c.Meta.Action != "A" || c.Meta.Data != "updated data" {
+			t.Fatalf("next callback: %+v", c)
+		}
+	})
+	app.Action("A", func(from string, meta vmmSchema.Meta) vmmSchema.Result {
+		if from != "updated" || meta.Action != "A" || meta.Data != "updated data" {
+			t.Fatalf("action input: %q %+v", from, meta)
+		}
+		return vmmSchema.Result{Output: "action"}
+	})
+	vm, err := app.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := vm.Apply("original", vmmSchema.Meta{Action: "missing"}); got.Output != "action" {
+		t.Fatalf("result: %+v", got)
 	}
 }

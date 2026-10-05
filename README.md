@@ -44,22 +44,35 @@ if err := server.Mount("hifire.0.1.0", Spawn); err != nil {
 
 ## BeforeApply
 
+Before callbacks use `func(*hvmkit.Context)` with no return value:
+
 ```go
-func (v *App) CheckPermission(from string, meta schema.Meta) (schema.Result, bool) {
-    if err := v.authorize(from, meta); err != nil {
-        return schema.Result{Error: err}, true
+func (v *App) CheckPermission(c *hvmkit.Context) {
+    if err := v.authorize(c.From, c.Meta); err != nil {
+        c.Stop(schema.Result{Error: err})
+        return
     }
-    return schema.Result{}, false
+    // Continue automatically.
+}
+
+func (v *App) SkipRecovery(c *hvmkit.Context) {
+    if v.shouldSkipRecovery(c.Meta) {
+        c.Stop(schema.Result{}) // Empty success; skip subsequent processing.
+        return
+    }
 }
 ```
 
 Callbacks run in registration order for every Apply, before looking up the Action:
 
-- `handled=false`: ignore the Result and continue.
-- `handled=true`: return the Result unchanged; skip all remaining callbacks and the Action. An empty Result is also a valid early return.
-- If every callback allows processing, look up `meta.Action` and execute it. Missing actions return `ErrUnknownAction`.
+- Returning normally (including a plain `return`) continues to the next callback.
+- `c.Stop(result)` marks the request as stopped. After the current callback returns, Apply returns that Result unchanged and skips all remaining callbacks and the Action.
+- **Stop does not exit the current function. Usually write `return` immediately after it. A plain `return` without Stop does not stop the chain.** Repeated Stop calls use the last Result.
+- If every callback allows processing, look up `c.Meta.Action` and execute it. Missing actions return `ErrUnknownAction`.
 
-Multiple registrations append, including repeated callbacks. Nil callbacks are rejected at Build. BeforeApply only supports preprocessing; there is no Context or Next.
+Each Apply creates its own Context, shared by that request's before callbacks. `c.From` and `c.Meta` initially contain the Apply arguments; changes are passed to later callbacks and the Action. Only use the Context during the callback, without concurrent access.
+
+Multiple registrations append, including repeated callbacks. Nil callbacks are rejected at Build. This uses Gin-style automatic continuation with explicit stopping, but only supports preprocessing: there is no Next, Abort alias, or postprocessing mechanism. Action keeps its existing `func(from string, meta schema.Meta) schema.Result` signature.
 
 ## Stateless VMs
 
@@ -91,3 +104,5 @@ See the [counter example](examples/counter) for a complete implementation.
 ## Migration
 
 `App` replaces `Builder`, and `ErrAppFrozen` replaces `ErrBuilderFrozen`. `Factory` has been removed: create and register your business instance inside a regular Spawn function. Build now handles cleanup on failure, so do not close the same instance again after a failed Build.
+
+BeforeApply callbacks now take `*hvmkit.Context`. Replace `return result, true` with `c.Stop(result); return`, and replace `return schema.Result{}, false` with a plain `return` or normal function completion.

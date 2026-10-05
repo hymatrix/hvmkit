@@ -19,8 +19,26 @@ var (
 // Handler is an Action callback using the native hymx request and result types.
 type Handler = func(from string, meta vmmSchema.Meta) vmmSchema.Result
 
-// BeforeApplyHandler returns handled=true to stop processing and return its Result.
-type BeforeApplyHandler = func(from string, meta vmmSchema.Meta) (vmmSchema.Result, bool)
+// BeforeApplyHandler checks a request. Processing continues unless it calls Stop.
+type BeforeApplyHandler = func(*Context)
+
+// Context holds one Apply request, shared by its BeforeApply callbacks.
+// Changes to From and Meta are passed to subsequent callbacks and the Action.
+// Use it only during the callback; it is not safe for concurrent use.
+type Context struct {
+	From    string
+	Meta    vmmSchema.Meta
+	stopped bool
+	result  vmmSchema.Result
+}
+
+// Stop skips remaining callbacks and the Action, returning result from Apply.
+// It does not exit the current callback; normally follow it with return.
+// If called more than once, the last result wins.
+func (c *Context) Stop(result vmmSchema.Result) {
+	c.stopped = true
+	c.result = result
+}
 
 // App registers callbacks for a single VM. Its zero value is ready to use.
 // It must not be copied or used concurrently. Build reports registration errors
@@ -51,7 +69,7 @@ func (app *App) invalid(format string, args ...any) {
 }
 
 // BeforeApply appends callbacks in registration order, before Action lookup.
-// A false handled value ignores the Result and continues to the next callback.
+// Callbacks continue automatically unless they call Context.Stop.
 func (app *App) BeforeApply(handlers ...BeforeApplyHandler) {
 	app.mutable()
 	for _, handler := range handlers {
@@ -180,16 +198,18 @@ type machine struct {
 var _ vmmSchema.Vm = (*machine)(nil)
 
 func (vm *machine) Apply(from string, meta vmmSchema.Meta) vmmSchema.Result {
+	c := &Context{From: from, Meta: meta}
 	for _, before := range vm.before {
-		if result, handled := before(from, meta); handled {
-			return result
+		before(c)
+		if c.stopped {
+			return c.result
 		}
 	}
-	handler, ok := vm.actions[meta.Action]
+	handler, ok := vm.actions[c.Meta.Action]
 	if !ok {
-		return vmmSchema.Result{Error: fmt.Errorf("%w: %q", ErrUnknownAction, meta.Action)}
+		return vmmSchema.Result{Error: fmt.Errorf("%w: %q", ErrUnknownAction, c.Meta.Action)}
 	}
-	return handler(from, meta)
+	return handler(c.From, c.Meta)
 }
 
 func (vm *machine) Checkpoint() (string, error) { return vm.checkpoint() }
