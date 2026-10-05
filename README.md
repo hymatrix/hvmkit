@@ -1,8 +1,8 @@
 # hvmkit
 
-A small Go library for building [hymx](https://github.com/hymatrix/hymx) VMs. Register your actions and lifecycle callbacks, then let a factory create a VM for each process.
+A small Go library for building [hymx](https://github.com/hymatrix/hymx) VMs. Create an app, register callbacks, and build a VM.
 
-Requires Go 1.24+. Uses hymx v0.5.0.
+Requires Go 1.24+. Uses hymx v0.6.0.
 
 ## Install
 
@@ -12,85 +12,82 @@ go get github.com/hymatrix/hvmkit
 
 ## Usage
 
-Define your app and register its methods explicitly:
+Write a regular Spawn function. Create a fresh business instance for each VM and register its callbacks directly:
 
 ```go
-package counter
-
-import (
-    "strconv"
-
-    "github.com/hymatrix/hvmkit"
-    vmmSchema "github.com/hymatrix/hymx/vmm/schema"
-)
-
-type App struct {
-    count int
-}
-
-func NewApp(env vmmSchema.Env) (*App, error) {
-    return &App{}, nil
-}
-
-func (a *App) Submit(from string, meta vmmSchema.Meta) vmmSchema.Result {
-    a.count++
-    return vmmSchema.Result{Output: a.count}
-}
-
-func (a *App) Checkpoint() (string, error) {
-    return strconv.Itoa(a.count), nil
-}
-
-func (a *App) Restore(data string) error {
-    count, err := strconv.Atoi(data)
+func Spawn(env schema.Env) (schema.Vm, error) {
+    v, err := NewApp(env)
     if err != nil {
-        return err
+        return nil, err
     }
-    a.count = count
-    return nil
-}
 
-var Spawn = hvmkit.Factory(
-    NewApp,
-    func(vm *hvmkit.Builder, app *App) {
-        vm.Action("Submit", app.Submit)
-        vm.Checkpoint(app.Checkpoint)
-        vm.Restore(app.Restore)
-        // Optional resource cleanup: vm.Close(app.Close)
-    },
-)
+    app := hvmkit.New()
+    app.BeforeApply(v.CheckAvailable, v.SkipRecovery)
+    app.BeforeApply(v.CheckPermission)
+    app.Action("ssh", v.SSH)
+    app.Checkpoint(v.Checkpoint)
+    app.Restore(v.Restore)
+    app.Close(v.Close)
+    return app.Build()
+}
 ```
 
-Mount it in your existing hymx startup code:
+Here `schema` is `github.com/hymatrix/hymx/vmm/schema`; `NewApp` and its methods belong to your application. No business interface is required.
+
+Mount the Spawn function in your existing hymx startup code:
 
 ```go
-if err := server.Mount("counter.0.1.0", Spawn); err != nil {
+if err := server.Mount("hifire.0.1.0", Spawn); err != nil {
     return err
 }
 ```
 
-Each Spawn calls `NewApp`, registers callbacks, and builds a VM. Actions dispatch by `meta.Action` and return your `Result` unchanged. Your app does not need to implement a hvmkit interface.
-
-## Stateless VMs
-
-For a VM without business state, use `Stateless()` instead of registering Checkpoint and Restore:
+## BeforeApply
 
 ```go
-func Spawn(env vmmSchema.Env) (vmmSchema.Vm, error) {
-    vm := hvmkit.New()
-    vm.Stateless()
-    vm.Action("Echo", func(from string, meta vmmSchema.Meta) vmmSchema.Result {
-        return vmmSchema.Result{Output: meta.Data}
-    })
-    return vm.Build()
+func (v *App) CheckPermission(from string, meta schema.Meta) (schema.Result, bool) {
+    if err := v.authorize(from, meta); err != nil {
+        return schema.Result{Error: err}, true
+    }
+    return schema.Result{}, false
 }
 ```
 
-## Notes
+Callbacks run in registration order for every Apply, before looking up the Action:
 
-- Stateful VMs require both Checkpoint and Restore. They must save and restore all business state needed for later execution.
-- Close is optional. If factory construction succeeds but VM building fails, the factory calls the registered Close callback to release resources.
-- Build rejects invalid or duplicate registrations and freezes configuration on success.
-- Your app owns storage, transactions, and state isolation. Replay and dry-run actions still execute normally.
+- `handled=false`: ignore the Result and continue.
+- `handled=true`: return the Result unchanged; skip all remaining callbacks and the Action. An empty Result is also a valid early return.
+- If every callback allows processing, look up `meta.Action` and execute it. Missing actions return `ErrUnknownAction`.
+
+Multiple registrations append, including repeated callbacks. Nil callbacks are rejected at Build. BeforeApply only supports preprocessing; there is no Context or Next.
+
+## Stateless VMs
+
+For a VM with no business state, use Stateless instead of Checkpoint and Restore:
+
+```go
+func Spawn(env schema.Env) (schema.Vm, error) {
+    app := hvmkit.New()
+    app.Stateless()
+    app.Action("echo", func(from string, meta schema.Meta) schema.Result {
+        return schema.Result{Output: meta.Data}
+    })
+    return app.Build()
+}
+```
+
+## Build and lifecycle
+
+- Build validates registration and freezes the App on both success and failure. Subsequent registration panics with `ErrAppFrozen`; subsequent Build calls return that error.
+- Invalid configuration returns `ErrInvalidConfig`. Action names must be nonblank and unique; callbacks must be non-nil. Lifecycle callbacks can only be registered once.
+- Stateful VMs require both Checkpoint and Restore. Stateless conflicts with either callback. Close is optional.
+- On Build failure, the first registered Close callback, if non-nil, runs once. Cleanup errors are joined with configuration errors. Register Close even if earlier registrations are invalid.
+- On success, the VM owns the callbacks and Close is invoked by its caller. Close is not made idempotent. Constructor failures must clean up their own partial resources.
+- App's zero value is usable. Do not copy an App or register concurrently. Business state, persistence, transactions, and callback synchronization belong to your application.
+- Replay and dry-run requests pass through the same before chain and Action dispatch. Any skipping policy belongs in your callbacks.
 
 See the [counter example](examples/counter) for a complete implementation.
+
+## Migration
+
+`App` replaces `Builder`, and `ErrAppFrozen` replaces `ErrBuilderFrozen`. `Factory` has been removed: create and register your business instance inside a regular Spawn function. Build now handles cleanup on failure, so do not close the same instance again after a failed Build.

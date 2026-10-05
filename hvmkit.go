@@ -5,7 +5,6 @@ package hvmkit
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"strings"
 
 	vmmSchema "github.com/hymatrix/hymx/vmm/schema"
@@ -13,18 +12,21 @@ import (
 
 var (
 	ErrInvalidConfig = errors.New("hvmkit: invalid configuration")
-	ErrBuilderFrozen = errors.New("hvmkit: builder is frozen")
+	ErrAppFrozen     = errors.New("hvmkit: app is frozen")
 	ErrUnknownAction = errors.New("hvmkit: unknown action")
 )
 
 // Handler is an Action callback using the native hymx request and result types.
 type Handler = func(from string, meta vmmSchema.Meta) vmmSchema.Result
 
-// Builder collects callbacks for a single VM. Its zero value is ready to use.
-// It must not be copied or used concurrently. Registration errors are reported
-// by Build. After a successful Build, registration methods panic with
-// ErrBuilderFrozen and subsequent Build calls return ErrBuilderFrozen.
-type Builder struct {
+// BeforeApplyHandler returns handled=true to stop processing and return its Result.
+type BeforeApplyHandler = func(from string, meta vmmSchema.Meta) (vmmSchema.Result, bool)
+
+// App registers callbacks for a single VM. Its zero value is ready to use.
+// It must not be copied or used concurrently. Build reports registration errors
+// and freezes the App, even on failure.
+type App struct {
+	before                              []BeforeApplyHandler
 	actions                             map[string]Handler
 	checkpoint                          func() (string, error)
 	restore                             func(string) error
@@ -35,121 +37,140 @@ type Builder struct {
 	errs                                []error
 }
 
-// New creates a Builder for explicit callback registration.
-func New() *Builder { return &Builder{} }
+// New creates an App for explicit callback registration.
+func New() *App { return &App{} }
 
-func (b *Builder) mutable() {
-	if b.frozen {
-		panic(ErrBuilderFrozen)
+func (app *App) mutable() {
+	if app.frozen {
+		panic(ErrAppFrozen)
 	}
 }
 
-func (b *Builder) invalid(format string, args ...any) {
-	b.errs = append(b.errs, fmt.Errorf(format, args...))
+func (app *App) invalid(format string, args ...any) {
+	app.errs = append(app.errs, fmt.Errorf(format, args...))
+}
+
+// BeforeApply appends callbacks in registration order, before Action lookup.
+// A false handled value ignores the Result and continues to the next callback.
+func (app *App) BeforeApply(handlers ...BeforeApplyHandler) {
+	app.mutable()
+	for _, handler := range handlers {
+		if handler == nil {
+			app.invalid("nil BeforeApply callback")
+			continue
+		}
+		app.before = append(app.before, handler)
+	}
 }
 
 // Action registers an exact, case-sensitive name. Names must not be blank.
-func (b *Builder) Action(name string, handler Handler) {
-	b.mutable()
+func (app *App) Action(name string, handler Handler) {
+	app.mutable()
 	if strings.TrimSpace(name) == "" {
-		b.invalid("action name must not be blank")
+		app.invalid("action name must not be blank")
 		return
 	}
-	if _, exists := b.actions[name]; exists {
-		b.invalid("duplicate action %q", name)
+	if _, exists := app.actions[name]; exists {
+		app.invalid("duplicate action %q", name)
 		return
 	}
-	if b.actions == nil {
-		b.actions = make(map[string]Handler)
+	if app.actions == nil {
+		app.actions = make(map[string]Handler)
 	}
-	b.actions[name] = handler
+	app.actions[name] = handler
 	if handler == nil {
-		b.invalid("action %q has a nil handler", name)
+		app.invalid("action %q has a nil handler", name)
 	}
 }
 
 // Checkpoint registers the callback that saves complete business state.
-func (b *Builder) Checkpoint(fn func() (string, error)) {
-	b.mutable()
-	if b.checkpointSet {
-		b.invalid("duplicate Checkpoint registration")
+func (app *App) Checkpoint(fn func() (string, error)) {
+	app.mutable()
+	if app.checkpointSet {
+		app.invalid("duplicate Checkpoint registration")
 		return
 	}
-	b.checkpointSet, b.checkpoint = true, fn
+	app.checkpointSet, app.checkpoint = true, fn
 	if fn == nil {
-		b.invalid("nil Checkpoint callback")
+		app.invalid("nil Checkpoint callback")
 	}
 }
 
 // Restore registers the callback that restores complete business state.
-func (b *Builder) Restore(fn func(string) error) {
-	b.mutable()
-	if b.restoreSet {
-		b.invalid("duplicate Restore registration")
+func (app *App) Restore(fn func(string) error) {
+	app.mutable()
+	if app.restoreSet {
+		app.invalid("duplicate Restore registration")
 		return
 	}
-	b.restoreSet, b.restore = true, fn
+	app.restoreSet, app.restore = true, fn
 	if fn == nil {
-		b.invalid("nil Restore callback")
+		app.invalid("nil Restore callback")
 	}
 }
 
 // Close registers optional resource cleanup. Register it even when another
-// registration is invalid so Factory can release resources on Build failure.
-func (b *Builder) Close(fn func() error) {
-	b.mutable()
-	if b.closeSet {
-		b.invalid("duplicate Close registration")
+// registration is invalid so Build can release resources on failure.
+func (app *App) Close(fn func() error) {
+	app.mutable()
+	if app.closeSet {
+		app.invalid("duplicate Close registration")
 		return
 	}
-	b.closeSet, b.close = true, fn
+	app.closeSet, app.close = true, fn
 	if fn == nil {
-		b.invalid("nil Close callback")
+		app.invalid("nil Close callback")
 	}
 }
 
 // Stateless declares that the entire VM has no business state. Repeated calls
 // are harmless. Custom Checkpoint and Restore callbacks are not allowed.
-func (b *Builder) Stateless() {
-	b.mutable()
-	b.stateless = true
+func (app *App) Stateless() {
+	app.mutable()
+	app.stateless = true
 }
 
-// Build validates configuration and freezes the Builder on success.
-// A failed Build does not release resources; Factory handles that cleanup.
-func (b *Builder) Build() (vmmSchema.Vm, error) {
-	if b.frozen {
-		return nil, ErrBuilderFrozen
+// Build freezes the App and validates configuration. It may be called only once.
+// On failure it calls the registered Close callback and joins any cleanup error.
+func (app *App) Build() (vmmSchema.Vm, error) {
+	if app.frozen {
+		return nil, ErrAppFrozen
 	}
-	errs := append([]error(nil), b.errs...)
-	if b.stateless {
-		if b.checkpointSet || b.restoreSet {
+	app.frozen = true
+	errs := app.errs
+	if app.stateless {
+		if app.checkpointSet || app.restoreSet {
 			errs = append(errs, errors.New("Stateless conflicts with Checkpoint/Restore"))
 		}
-	} else if !b.checkpointSet || !b.restoreSet {
+	} else if !app.checkpointSet || !app.restoreSet {
 		errs = append(errs, errors.New("stateful VM requires both Checkpoint and Restore"))
 	}
 	if len(errs) > 0 {
-		return nil, errors.Join(append([]error{ErrInvalidConfig}, errs...)...)
+		err := errors.Join(append([]error{ErrInvalidConfig}, errs...)...)
+		if app.close != nil {
+			err = errors.Join(err, app.close())
+		}
+		return nil, err
 	}
 	vm := &machine{
-		actions:    maps.Clone(b.actions),
-		checkpoint: b.checkpoint,
-		restore:    b.restore,
-		close:      b.close,
+		before:     app.before,
+		actions:    app.actions,
+		checkpoint: app.checkpoint,
+		restore:    app.restore,
+		close:      app.close,
 	}
-	if b.stateless {
+	if app.stateless {
 		vm.checkpoint = func() (string, error) { return "", nil }
 		vm.restore = func(string) error { return nil }
 	}
 	if vm.close == nil {
 		vm.close = func() error { return nil }
 	}
-	b.frozen = true
 	return vm, nil
 }
 
 type machine struct {
+	before     []BeforeApplyHandler
 	actions    map[string]Handler
 	checkpoint func() (string, error)
 	restore    func(string) error
@@ -159,6 +180,11 @@ type machine struct {
 var _ vmmSchema.Vm = (*machine)(nil)
 
 func (vm *machine) Apply(from string, meta vmmSchema.Meta) vmmSchema.Result {
+	for _, before := range vm.before {
+		if result, handled := before(from, meta); handled {
+			return result
+		}
+	}
 	handler, ok := vm.actions[meta.Action]
 	if !ok {
 		return vmmSchema.Result{Error: fmt.Errorf("%w: %q", ErrUnknownAction, meta.Action)}

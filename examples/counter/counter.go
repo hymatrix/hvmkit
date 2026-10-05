@@ -1,4 +1,4 @@
-// Package counter demonstrates explicit registration with a per-process factory.
+// Package counter demonstrates explicit registration in a per-process Spawn function.
 package counter
 
 import (
@@ -29,12 +29,15 @@ func (a *App) Restore(data string) error {
 }
 
 // Spawn can be passed directly to server.Mount("counter.0.1.0", Spawn).
-var Spawn vmmSchema.VmSpawnFunc = hvmkit.Factory(
-	NewApp,
-	func(vm *hvmkit.Builder, app *App) {
-		vm.Action("Submit", app.Submit)
-		vm.Checkpoint(app.Checkpoint)
-		vm.Restore(app.Restore)
-		// Register vm.Close(app.Close) if the app owns resources.
-	},
-)
+func Spawn(env vmmSchema.Env) (vmmSchema.Vm, error) {
+	v, err := NewApp(env)
+	if err != nil {
+		return nil, err
+	}
+	app := hvmkit.New()
+	app.Action("Submit", v.Submit)
+	app.Checkpoint(v.Checkpoint)
+	app.Restore(v.Restore)
+	// Register app.Close(v.Close) if the business instance owns resources.
+	return app.Build()
+}
